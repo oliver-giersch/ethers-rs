@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use futures_channel::mpsc;
 use futures_util::stream::{Fuse, StreamExt};
 use oneshot::error::RecvError;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{value::RawValue, Deserializer};
 use std::{
     collections::HashMap,
     path::Path,
@@ -34,14 +35,23 @@ pub struct Ipc {
     messages_tx: mpsc::UnboundedSender<TransportMessage>,
 }
 
-type Pending = oneshot::Sender<serde_json::Value>;
-type Subscription = mpsc::UnboundedSender<serde_json::Value>;
+type Pending = oneshot::Sender<Result<Box<RawValue>, JsonRpcError>>;
+type Subscription = mpsc::UnboundedSender<Box<RawValue>>;
 
 #[derive(Debug)]
 enum TransportMessage {
     Request { id: u64, request: String, sender: Pending },
     Subscribe { id: U256, sink: Subscription },
     Unsubscribe { id: U256 },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Incoming<'a> {
+    #[serde(borrow)]
+    Notification(Notification<'a>),
+    #[serde(borrow)]
+    Response(Response<'a>),
 }
 
 impl Ipc {
@@ -93,15 +103,15 @@ impl JsonRpcClient for Ipc {
         self.send(payload)?;
 
         // Wait for the response from the IPC server.
-        let res = receiver.await?;
+        let res = receiver.await??;
 
         // Parse JSON response.
-        Ok(serde_json::from_value(res)?)
+        Ok(serde_json::from_str(res.get())?)
     }
 }
 
 impl PubsubClient for Ipc {
-    type NotificationStream = mpsc::UnboundedReceiver<serde_json::Value>;
+    type NotificationStream = mpsc::UnboundedReceiver<Box<RawValue>>;
 
     fn subscribe<T: Into<U256>>(&self, id: T) -> Result<Self::NotificationStream, IpcError> {
         let (sink, stream) = mpsc::unbounded();
@@ -149,7 +159,7 @@ where
             loop {
                 let closed = self.process(&mut read_buffer).await.expect("WS Server panic");
                 if closed && self.pending.is_empty() {
-                    break
+                    break;
                 }
             }
         };
@@ -216,35 +226,27 @@ where
     ) -> Result<(), IpcError> {
         // Extend buffer of previously unread with the new read bytes
         read_buffer.extend_from_slice(&bytes);
-
-        let read_len = {
-            // Deserialize as many full elements from the stream as exists
-            let mut de: serde_json::StreamDeserializer<_, serde_json::Value> =
-                serde_json::Deserializer::from_slice(read_buffer).into_iter();
-
-            // Iterate through these elements, and handle responses/notifications
-            while let Some(Ok(value)) = de.next() {
-                if let Ok(notification) =
-                    serde_json::from_value::<Notification<serde_json::Value>>(value.clone())
-                {
+        // Deserialize as many full elements from the stream as exists
+        let mut de = Deserializer::from_slice(read_buffer).into_iter();
+        // Iterate through these elements, and handle responses/notifications
+        while let Some(res) = de.next() {
+            match res? {
+                Incoming::Response(response) => {
+                    if let Err(e) = self.respond(response) {
+                        error!(err = %e, "failed to send IPC response")
+                    }
+                }
+                Incoming::Notification(notification) => {
                     // Send notify response if okay.
                     if let Err(e) = self.notify(notification) {
                         error!("Failed to send IPC notification: {}", e)
                     }
-                } else if let Ok(response) =
-                    serde_json::from_value::<Response<serde_json::Value>>(value)
-                {
-                    if let Err(e) = self.respond(response) {
-                        error!("Failed to send IPC response: {}", e)
-                    }
-                } else {
-                    warn!("JSON from IPC stream is not a response or notification");
                 }
             }
+        }
 
-            // Get the offset of bytes to handle partial buffer reads
-            de.byte_offset()
-        };
+        // Get the offset of bytes to handle partial buffer reads
+        let read_len = de.byte_offset();
 
         // Reset buffer to just include the partial value bytes.
         read_buffer.copy_within(read_len.., 0);
@@ -255,10 +257,10 @@ where
 
     /// Sends notification through the channel based on the ID of the subscription.
     /// This handles streaming responses.
-    fn notify(&mut self, notification: Notification<serde_json::Value>) -> Result<(), IpcError> {
+    fn notify(&mut self, notification: Notification<'_>) -> Result<(), IpcError> {
         let id = notification.params.subscription;
         if let Some(tx) = self.subscriptions.get(&id) {
-            tx.unbounded_send(notification.params.result).map_err(|_| {
+            tx.unbounded_send(notification.params.result.to_owned()).map_err(|_| {
                 IpcError::ChannelError(format!("Subscription receiver {} dropped", id))
             })?;
         }
@@ -269,17 +271,15 @@ where
     /// Sends JSON response through the channel based on the ID in that response.
     /// This handles RPC calls with only one response, and the channel entry is dropped after
     /// sending.
-    fn respond(&mut self, output: Response<serde_json::Value>) -> Result<(), IpcError> {
-        let id = output.id;
-
-        // Converts output into result, to send data if valid response.
-        let value = output.data.into_value()?;
+    fn respond(&mut self, response: Response<'_>) -> Result<(), IpcError> {
+        let id = response.id();
+        let res = response.into_result();
 
         let response_tx = self.pending.remove(&id).ok_or_else(|| {
             IpcError::ChannelError("No response channel exists for the response ID".to_string())
         })?;
 
-        response_tx.send(value).map_err(|_| {
+        response_tx.send(res).map_err(|_| {
             IpcError::ChannelError("Receiver channel for response has been dropped".to_string())
         })?;
 
@@ -353,7 +353,7 @@ mod test {
         let mut blocks = Vec::new();
         for _ in 0..3 {
             let item = stream.next().await.unwrap();
-            let block = serde_json::from_value::<Block<TxHash>>(item).unwrap();
+            let block: Block<TxHash> = serde_json::from_str(item.get()).unwrap();
             blocks.push(block.number.unwrap_or_default().as_u64());
         }
         let offset = blocks[0] - block_num;

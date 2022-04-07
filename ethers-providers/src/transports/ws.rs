@@ -12,6 +12,7 @@ use futures_util::{
     stream::{Fuse, Stream, StreamExt},
 };
 use serde::{de::DeserializeOwned, Serialize};
+use serde_json::value::RawValue;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     fmt::{self, Debug},
@@ -65,8 +66,8 @@ if_not_wasm! {
     use tungstenite::client::IntoClientRequest;
 }
 
-type Pending = oneshot::Sender<Result<serde_json::Value, JsonRpcError>>;
-type Subscription = mpsc::UnboundedSender<serde_json::Value>;
+type Pending = oneshot::Sender<Result<Box<RawValue>, JsonRpcError>>;
+type Subscription = mpsc::UnboundedSender<Box<RawValue>>;
 
 /// Instructions for the `WsServer`.
 enum Instruction {
@@ -80,9 +81,11 @@ enum Instruction {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
-enum Incoming {
-    Notification(Notification<serde_json::Value>),
-    Response(Response<serde_json::Value>),
+enum Incoming<'a> {
+    #[serde(borrow)]
+    Notification(Notification<'a>),
+    #[serde(borrow)]
+    Response(Response<'a>),
 }
 
 /// A JSON-RPC Client over Websockets.
@@ -184,19 +187,16 @@ impl JsonRpcClient for Ws {
         // send the data
         self.send(payload)?;
 
-        // wait for the response
-        let res = receiver.await?;
-
-        // in case the request itself has any errors
-        let res = res?;
+        // wait for the response (the request itself may have errors as well)
+        let res = receiver.await??;
 
         // parse it
-        Ok(serde_json::from_value(res)?)
+        Ok(serde_json::from_str(res.get())?)
     }
 }
 
 impl PubsubClient for Ws {
-    type NotificationStream = mpsc::UnboundedReceiver<serde_json::Value>;
+    type NotificationStream = mpsc::UnboundedReceiver<Box<RawValue>>;
 
     fn subscribe<T: Into<U256>>(&self, id: T) -> Result<Self::NotificationStream, ClientError> {
         let (sink, stream) = mpsc::unbounded();
@@ -250,12 +250,12 @@ where
             loop {
                 if self.is_done() {
                     debug!("work complete");
-                    break
+                    break;
                 }
                 match self.tick().await {
                     Err(ClientError::UnexpectedClose) => {
                         error!("{}", ClientError::UnexpectedClose);
-                        break
+                        break;
                     }
                     Err(e) => {
                         panic!("WS Server panic: {}", e);
@@ -328,21 +328,23 @@ where
             Err(err) => return Err(ClientError::JsonError(err)),
 
             Ok(Incoming::Response(resp)) => {
-                if let Some(request) = self.pending.remove(&resp.id) {
+                if let Some(request) = self.pending.remove(&resp.id()) {
                     if !request.is_canceled() {
-                        request.send(resp.data.into_result()).map_err(to_client_error)?;
+                        request.send(resp.into_result()).map_err(to_client_error)?;
                     }
                 }
             }
             Ok(Incoming::Notification(notification)) => {
                 let id = notification.params.subscription;
                 if let Entry::Occupied(stream) = self.subscriptions.entry(id) {
-                    if let Err(err) = stream.get().unbounded_send(notification.params.result) {
+                    if let Err(err) =
+                        stream.get().unbounded_send(notification.params.result.to_owned())
+                    {
                         if err.is_disconnected() {
                             // subscription channel was closed on the receiver end
                             stream.remove();
                         }
-                        return Err(to_client_error(err))
+                        return Err(to_client_error(err));
                     }
                 }
             }
@@ -516,7 +518,7 @@ mod tests {
         let mut blocks = Vec::new();
         for _ in 0..3 {
             let item = stream.next().await.unwrap();
-            let block = serde_json::from_value::<Block<TxHash>>(item).unwrap();
+            let block: Block<TxHash> = serde_json::from_str(item.get()).unwrap();
             blocks.push(block.number.unwrap_or_default().as_u64());
         }
 

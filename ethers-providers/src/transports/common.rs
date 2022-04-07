@@ -211,6 +211,11 @@ mod tests {
 
     #[test]
     fn deser_response() {
+        let _ =
+            serde_json::from_str::<Response<'_>>(r#"{"jsonrpc":"2.0","result":19}"#).unwrap_err();
+        let _ = serde_json::from_str::<Response<'_>>(r#"{"jsonrpc":"3.0","result":19,"id":1}"#)
+            .unwrap_err();
+
         let response: Response<'_> =
             serde_json::from_str(r#"{"jsonrpc":"2.0","result":19,"id":1}"#).unwrap();
 

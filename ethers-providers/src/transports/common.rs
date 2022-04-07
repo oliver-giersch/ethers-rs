@@ -1,12 +1,14 @@
 // Code adapted from: https://github.com/althea-net/guac_rs/tree/master/web3/src/jsonrpc
-use ethers_core::types::U256;
+use std::fmt;
+
 use serde::{
     de::{self, MapAccess, Visitor},
     Deserialize, Serialize,
 };
 use serde_json::{value::RawValue, Value};
-use std::fmt;
 use thiserror::Error;
+
+use ethers_core::types::U256;
 
 #[derive(Deserialize, Debug, Clone, Error)]
 /// A JSON-RPC 2.0 error
@@ -128,7 +130,9 @@ impl<'de: 'a, 'a> Deserialize<'de> for Response<'a> {
                         "jsonrpc" => {
                             let value: &'de str = map.next_value()?;
                             if value != "2.0" {
-                                return Err(de::Error::custom("value for 'jsonrpc' must be '2.0'"));
+                                return Err(de::Error::custom(
+                                    "value for key 'jsonrpc' must be '2.0'",
+                                ));
                             }
 
                             let prev = jsonrpc.replace(value);
@@ -150,12 +154,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for Response<'a> {
                                 return Err(de::Error::custom("got key 'error' twice"));
                             }
                         }
-                        key => {
-                            return Err(de::Error::custom(format!(
-                                "got invalid key '{}' twice",
-                                key
-                            )))
-                        }
+                        key => return Err(de::Error::custom(format!("got invalid key '{}'", key))),
                     }
                 }
 

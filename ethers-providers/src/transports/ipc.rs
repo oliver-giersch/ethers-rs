@@ -1,17 +1,5 @@
-use crate::{
-    provider::ProviderError,
-    transports::common::{JsonRpcError, Notification, Request, Response},
-    JsonRpcClient, PubsubClient,
-};
-use ethers_core::types::U256;
-
-use async_trait::async_trait;
-use futures_channel::mpsc;
-use futures_util::stream::{Fuse, StreamExt};
-use oneshot::error::RecvError;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::{value::RawValue, Deserializer};
 use std::{
+    cell::RefCell,
     collections::HashMap,
     path::Path,
     sync::{
@@ -19,28 +7,39 @@ use std::{
         Arc,
     },
 };
+
+use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
+use futures_channel::mpsc;
+use futures_util::stream::StreamExt;
+use oneshot::error::RecvError;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{value::RawValue, Deserializer};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
-    net::UnixStream,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+        UnixStream,
+    },
     sync::oneshot,
 };
-use tokio_util::io::ReaderStream;
 use tracing::{error, warn};
 
-/// Unix Domain Sockets (IPC) transport.
-#[derive(Debug, Clone)]
-pub struct Ipc {
-    id: Arc<AtomicU64>,
-    messages_tx: mpsc::UnboundedSender<TransportMessage>,
-}
+use ethers_core::types::U256;
 
-type Pending = oneshot::Sender<Result<Box<RawValue>, JsonRpcError>>;
+use crate::{
+    provider::ProviderError,
+    transports::common::{JsonRpcError, Notification, Request, Response},
+    JsonRpcClient, PubsubClient,
+};
+
+type Pending = oneshot::Sender<Result<Box<RawValue>, IpcError>>;
 type Subscription = mpsc::UnboundedSender<Box<RawValue>>;
 
 #[derive(Debug)]
 enum TransportMessage {
-    Request { id: u64, request: String, sender: Pending },
+    Request { id: u64, request: Box<[u8]>, sender: Pending },
     Subscribe { id: U256, sink: Subscription },
     Unsubscribe { id: U256 },
 }
@@ -54,21 +53,24 @@ enum Incoming<'a> {
     Response(Response<'a>),
 }
 
+/// Unix Domain Sockets (IPC) transport.
+#[derive(Debug, Clone)]
+pub struct Ipc {
+    id: Arc<AtomicU64>,
+    messages_tx: mpsc::UnboundedSender<TransportMessage>,
+}
+
+#[cfg(unix)]
 impl Ipc {
-    /// Creates a new IPC transport from a Async Reader / Writer
-    fn new<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) -> Self {
-        let id = Arc::new(AtomicU64::new(1));
-        let (messages_tx, messages_rx) = mpsc::unbounded();
-
-        IpcServer::new(stream, messages_rx).spawn();
-        Self { id, messages_tx }
-    }
-
     /// Creates a new IPC transport from a given path using Unix sockets
-    #[cfg(unix)]
-    pub async fn connect<P: AsRef<Path>>(path: P) -> Result<Self, IpcError> {
+    pub async fn connect(path: impl AsRef<Path>) -> Result<Self, IpcError> {
         let ipc = UnixStream::connect(path).await?;
-        Ok(Self::new(ipc))
+        let id = Arc::new(AtomicU64::new(1));
+
+        let (messages_tx, messages_rx) = mpsc::unbounded();
+        spawn_ipc_server(ipc, messages_rx);
+
+        Ok(Self { id, messages_tx })
     }
 
     fn send(&self, msg: TransportMessage) -> Result<(), IpcError> {
@@ -95,7 +97,9 @@ impl JsonRpcClient for Ipc {
         let (sender, receiver) = oneshot::channel();
         let payload = TransportMessage::Request {
             id: next_id,
-            request: serde_json::to_string(&Request::new(next_id, method, params))?,
+            request: serde_json::to_string(&Request::new(next_id, method, params))?
+                .into_bytes()
+                .into_boxed_slice(),
             sender,
         };
 
@@ -103,10 +107,12 @@ impl JsonRpcClient for Ipc {
         self.send(payload)?;
 
         // Wait for the response from the IPC server.
-        let res = receiver.await??;
+        let result = receiver.await?;
+        // In case the response was an error, return it to the caller
+        let response = result?;
 
-        // Parse JSON response.
-        Ok(serde_json::from_str(res.get())?)
+        // Parse the JSON result to the expected type.
+        Ok(serde_json::from_str(response.get())?)
     }
 }
 
@@ -124,158 +130,116 @@ impl PubsubClient for Ipc {
     }
 }
 
-struct IpcServer<T> {
-    socket_reader: Fuse<ReaderStream<ReadHalf<T>>>,
-    socket_writer: WriteHalf<T>,
-    requests: Fuse<mpsc::UnboundedReceiver<TransportMessage>>,
-    pending: HashMap<u64, Pending>,
-    subscriptions: HashMap<U256, Subscription>,
+fn spawn_ipc_server(ipc: UnixStream, requests: mpsc::UnboundedReceiver<TransportMessage>) {
+    // IDEA: spawn a thread with a thread-local runtime?
+    let _ = tokio::task::spawn_blocking(|| {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async move {
+            let (reader, writer) = ipc.into_split();
+            let shared = Shared { pending: Default::default(), subscriptions: Default::default() };
+
+            let handle_reads = shared.handle_ipc_reads(reader);
+            let handle_writes = shared.handle_ipc_writes(writer, requests);
+
+            if let Err(e) = futures_util::try_join!(handle_reads, handle_writes) {
+                // FIXME: all subscriptions should also be resolved with an error
+                // notify all pending requests of the error, which "unblocks" them
+                error!(error = ?e, "IPC server exited due to an error");
+                for (_, sender) in shared.pending.borrow_mut().drain() {
+                    let _ = sender.send(Err(IpcError::ChannelError(
+                        "IPC connection was closed unexpectedly".to_string(),
+                    )));
+                }
+            }
+        });
+    });
 }
 
-impl<T> IpcServer<T>
-where
-    T: AsyncRead + AsyncWrite,
-{
-    /// Instantiates the Websocket Server
-    pub fn new(ipc: T, requests: mpsc::UnboundedReceiver<TransportMessage>) -> Self {
-        let (socket_reader, socket_writer) = tokio::io::split(ipc);
-        let socket_reader = ReaderStream::new(socket_reader).fuse();
-        Self {
-            socket_reader,
-            socket_writer,
-            requests: requests.fuse(),
-            pending: HashMap::default(),
-            subscriptions: HashMap::default(),
+struct Shared {
+    pending: RefCell<HashMap<u64, Pending>>,
+    subscriptions: RefCell<HashMap<U256, Subscription>>,
+}
+
+impl Shared {
+    async fn handle_ipc_reads(&self, mut reader: OwnedReadHalf) -> Result<(), IpcError> {
+        let mut buf = BytesMut::with_capacity(4096);
+        loop {
+            // Try to read the next batch of bytes into the buffer
+            let read = reader.read_buf(&mut buf).await?;
+            if read == 0 {
+                // eof, socket was closed
+                return Ok(());
+            }
+
+            // Split off the received bytes
+            let bytes = buf.split_to(read).freeze();
+            // Parse all complete jsonrpc messages and send each to its
+            // respective receiver
+            self.handle_bytes(bytes)?;
         }
     }
 
-    /// Spawns the event loop
-    fn spawn(mut self)
-    where
-        T: 'static + Send,
-    {
-        let f = async move {
-            let mut read_buffer = Vec::new();
-            loop {
-                let closed = self.process(&mut read_buffer).await.expect("WS Server panic");
-                if closed && self.pending.is_empty() {
-                    break;
+    async fn handle_ipc_writes(
+        &self,
+        mut writer: OwnedWriteHalf,
+        mut requests: mpsc::UnboundedReceiver<TransportMessage>,
+    ) -> Result<(), IpcError> {
+        use TransportMessage::*;
+
+        while let Some(msg) = requests.next().await {
+            match msg {
+                Request { id, request, sender } => {
+                    if self.pending.borrow_mut().insert(id, sender).is_some() {
+                        warn!("Replacing a pending request with id {:?}", id);
+                    }
+
+                    if let Err(err) = writer.write(&request).await {
+                        error!("IPC connection error: {:?}", err);
+                        self.pending.borrow_mut().remove(&id);
+                    }
+                }
+                Subscribe { id, sink } => {
+                    if self.subscriptions.borrow_mut().insert(id, sink).is_some() {
+                        warn!("Replacing already-registered subscription with id {:?}", id);
+                    }
+                }
+                Unsubscribe { id } => {
+                    if self.subscriptions.borrow_mut().remove(&id).is_none() {
+                        warn!("Unsubscribing from non-existent subscription with id {:?}", id);
+                    }
                 }
             }
-        };
-
-        tokio::spawn(f);
-    }
-
-    /// Processes 1 item selected from the incoming `requests` or `socket`
-    #[allow(clippy::single_match)]
-    async fn process(&mut self, read_buffer: &mut Vec<u8>) -> Result<bool, IpcError> {
-        futures_util::select! {
-            // Handle requests
-            msg = self.requests.next() => match msg {
-                Some(msg) => self.handle_request(msg).await?,
-                None => return Ok(true),
-            },
-            // Handle socket messages
-            msg = self.socket_reader.next() => match msg {
-                Some(Ok(msg)) => self.handle_socket(read_buffer, msg)?,
-                Some(Err(err)) => {
-                    error!("IPC read error: {:?}", err);
-                    return Err(err.into());
-                },
-                None => {},
-            },
-            // finished
-            complete => {},
-        };
-
-        Ok(false)
-    }
-
-    async fn handle_request(&mut self, msg: TransportMessage) -> Result<(), IpcError> {
-        match msg {
-            TransportMessage::Request { id, request, sender } => {
-                if self.pending.insert(id, sender).is_some() {
-                    warn!("Replacing a pending request with id {:?}", id);
-                }
-
-                if let Err(err) = self.socket_writer.write(request.as_bytes()).await {
-                    error!("IPC connection error: {:?}", err);
-                    self.pending.remove(&id);
-                }
-            }
-            TransportMessage::Subscribe { id, sink } => {
-                if self.subscriptions.insert(id, sink).is_some() {
-                    warn!("Replacing already-registered subscription with id {:?}", id);
-                }
-            }
-            TransportMessage::Unsubscribe { id } => {
-                if self.subscriptions.remove(&id).is_none() {
-                    warn!("Unsubscribing from non-existent subscription with id {:?}", id);
-                }
-            }
-        };
+        }
 
         Ok(())
     }
 
-    fn handle_socket(
-        &mut self,
-        read_buffer: &mut Vec<u8>,
-        bytes: bytes::Bytes,
-    ) -> Result<(), IpcError> {
-        // Extend buffer of previously unread with the new read bytes
-        read_buffer.extend_from_slice(&bytes);
-        // Deserialize as many full elements from the stream as exists
-        let mut de = Deserializer::from_slice(read_buffer).into_iter();
-        // Iterate through these elements, and handle responses/notifications
-        while let Some(res) = de.next() {
-            match res? {
+    fn handle_bytes(&self, bytes: Bytes) -> Result<(), IpcError> {
+        let mut de = Deserializer::from_slice(&bytes).into_iter();
+        while let Some(incoming) = de.next().transpose()? {
+            match incoming {
                 Incoming::Response(response) => {
-                    if let Err(e) = self.respond(response) {
-                        error!(err = %e, "failed to send IPC response")
+                    if let Err(e) = self.send_response(response) {
+                        error!(err = %e, "Failed to send IPC response");
                     }
                 }
                 Incoming::Notification(notification) => {
                     // Send notify response if okay.
-                    if let Err(e) = self.notify(notification) {
-                        error!("Failed to send IPC notification: {}", e)
+                    if let Err(e) = self.send_notification(notification) {
+                        error!(err = %e, "Failed to send IPC notification");
                     }
                 }
             }
         }
 
-        // Get the offset of bytes to handle partial buffer reads
-        let read_len = de.byte_offset();
-
-        // Reset buffer to just include the partial value bytes.
-        read_buffer.copy_within(read_len.., 0);
-        read_buffer.truncate(read_buffer.len() - read_len);
-
         Ok(())
     }
 
-    /// Sends notification through the channel based on the ID of the subscription.
-    /// This handles streaming responses.
-    fn notify(&mut self, notification: Notification<'_>) -> Result<(), IpcError> {
-        let id = notification.params.subscription;
-        if let Some(tx) = self.subscriptions.get(&id) {
-            tx.unbounded_send(notification.params.result.to_owned()).map_err(|_| {
-                IpcError::ChannelError(format!("Subscription receiver {} dropped", id))
-            })?;
-        }
-
-        Ok(())
-    }
-
-    /// Sends JSON response through the channel based on the ID in that response.
-    /// This handles RPC calls with only one response, and the channel entry is dropped after
-    /// sending.
-    fn respond(&mut self, response: Response<'_>) -> Result<(), IpcError> {
+    fn send_response(&self, response: Response<'_>) -> Result<(), IpcError> {
         let id = response.id();
-        let res = response.into_result();
+        let res = response.into_result().map_err(Into::into);
 
-        let response_tx = self.pending.remove(&id).ok_or_else(|| {
+        let response_tx = self.pending.borrow_mut().remove(&id).ok_or_else(|| {
             IpcError::ChannelError("No response channel exists for the response ID".to_string())
         })?;
 
@@ -285,9 +249,22 @@ where
 
         Ok(())
     }
+
+    /// Sends notification through the channel based on the ID of the subscription.
+    /// This handles streaming responses.
+    fn send_notification(&self, notification: Notification<'_>) -> Result<(), IpcError> {
+        let id = notification.params.subscription;
+        if let Some(tx) = self.subscriptions.borrow().get(&id) {
+            tx.unbounded_send(notification.params.result.to_owned()).map_err(|_| {
+                IpcError::ChannelError(format!("Subscription receiver {} dropped", id))
+            })?;
+        }
+
+        Ok(())
+    }
 }
 
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 /// Error thrown when sending or receiving an IPC message.
 pub enum IpcError {
     /// Thrown if deserialization failed
